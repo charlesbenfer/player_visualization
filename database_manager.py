@@ -10,6 +10,7 @@ class MLBDatabaseManager:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
         self.create_tables()
+        self.player_register = None
         
     def create_tables(self):
         """Create database tables for MLB data"""
@@ -164,6 +165,90 @@ class MLBDatabaseManager:
         
         self.conn.commit()
     
+    def load_player_register(self):
+        """Load Chadwick Register for player ID to name mapping"""
+        if self.player_register is None:
+            print("Loading Chadwick Register...")
+            self.player_register = pyb.chadwick_register()
+            # Filter to only active MLB players
+            self.player_register = self.player_register[
+                self.player_register['key_mlbam'].notna() &
+                (self.player_register['mlb_played_last'] >= 2020)  # Recent players
+            ].copy()
+            print(f"Loaded {len(self.player_register)} player records")
+        return self.player_register
+    
+    def get_player_name_from_id(self, player_id):
+        """Convert player ID to name using Chadwick Register"""
+        register = self.load_player_register()
+        
+        # Convert to int for matching
+        try:
+            player_id = int(player_id)
+        except (ValueError, TypeError):
+            return None
+            
+        player_row = register[register['key_mlbam'] == player_id]
+        if not player_row.empty:
+            last_name = player_row.iloc[0]['name_last']
+            first_name = player_row.iloc[0]['name_first']
+            return f"{last_name}, {first_name}"
+        return None
+    
+    def get_player_id_from_name(self, player_name):
+        """Convert player name to ID using Chadwick Register"""
+        register = self.load_player_register()
+        
+        # Handle "Last, First" format
+        if ',' in player_name:
+            last_name, first_name = player_name.split(',', 1)
+            last_name = last_name.strip()
+            first_name = first_name.strip()
+        else:
+            return None
+            
+        player_row = register[
+            (register['name_last'] == last_name) & 
+            (register['name_first'] == first_name)
+        ]
+        
+        if not player_row.empty:
+            return int(player_row.iloc[0]['key_mlbam'])
+        return None
+    
+    def get_all_available_players(self):
+        """Get all players available in the database (hitters and pitchers)"""
+        register = self.load_player_register()
+        
+        # Get all unique player IDs from statcast data
+        batter_query = 'SELECT DISTINCT batter FROM statcast_data WHERE batter IS NOT NULL'
+        pitcher_query = 'SELECT DISTINCT pitcher FROM statcast_data WHERE pitcher IS NOT NULL' 
+        
+        batters_df = pd.read_sql_query(batter_query, self.conn)
+        pitchers_df = pd.read_sql_query(pitcher_query, self.conn)
+        
+        # Convert IDs to names
+        available_players = []
+        
+        # Process batters
+        for batter_id in batters_df['batter']:
+            name = self.get_player_name_from_id(batter_id)
+            if name:
+                available_players.append({'name': name, 'type': 'hitter', 'id': batter_id})
+        
+        # Process pitchers  
+        for pitcher_id in pitchers_df['pitcher']:
+            name = self.get_player_name_from_id(pitcher_id)
+            if name:
+                # Check if already added as hitter (two-way player)
+                existing = [p for p in available_players if p['name'] == name]
+                if existing:
+                    existing[0]['type'] = 'two-way'
+                else:
+                    available_players.append({'name': name, 'type': 'pitcher', 'id': pitcher_id})
+        
+        return sorted(available_players, key=lambda x: x['name'])
+    
     def fetch_and_store_date_range(self, start_date, end_date):
         """Fetch and store data for a date range"""
         current_date = start_date
@@ -192,6 +277,19 @@ class MLBDatabaseManager:
                     (statcast_subset['launch_angle'].between(26, 30))
                 ).fillna(False).astype(int)
                 
+                # Check for existing data before inserting to prevent duplicates
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM statcast_data WHERE date = ?", (date_str,))
+                existing_count = cursor.fetchone()[0]
+                
+                if existing_count > 0:
+                    print(f"  ⚠ Found {existing_count} existing records for {date_str}")
+                    # Remove existing data for this date first to prevent duplicates
+                    cursor.execute("DELETE FROM statcast_data WHERE date = ?", (date_str,))
+                    self.conn.commit()
+                    print(f"  ✓ Removed existing data to prevent duplicates")
+                
+                # Insert new data
                 statcast_subset.to_sql('statcast_data', self.conn, 
                                       if_exists='append', index=False)
                 
@@ -235,10 +333,40 @@ class MLBDatabaseManager:
         cursor.execute('DELETE FROM daily_hitting WHERE date < ?', (cutoff_date,))
         cursor.execute('DELETE FROM daily_pitching WHERE date < ?', (cutoff_date,))
         cursor.execute('DELETE FROM statcast_data WHERE date < ?', (cutoff_date,))
-        cursor.execute('DELETE FROM data_updates WHERE data_date < ?', (cutoff_date,))
+    
+    def remove_duplicate_data(self):
+        """Remove duplicate records from statcast_data table"""
+        cursor = self.conn.cursor()
         
-        self.conn.commit()
-        print(f"Removed data older than {cutoff_date}")
+        print("Checking for duplicate records...")
+        
+        # Get count before cleanup
+        cursor.execute("SELECT COUNT(*) FROM statcast_data")
+        before_count = cursor.fetchone()[0]
+        
+        # Remove duplicates by keeping only the first occurrence of each unique combination
+        cursor.execute('''
+            DELETE FROM statcast_data 
+            WHERE id NOT IN (
+                SELECT MIN(id) 
+                FROM statcast_data 
+                GROUP BY date, game_pk, pitcher_id, batter_id, balls, strikes, pitch_type
+            )
+        ''')
+        
+        # Get count after cleanup
+        cursor.execute("SELECT COUNT(*) FROM statcast_data")
+        after_count = cursor.fetchone()[0]
+        
+        removed_count = before_count - after_count
+        
+        if removed_count > 0:
+            print(f"✓ Removed {removed_count} duplicate records ({before_count} -> {after_count})")
+            self.conn.commit()
+        else:
+            print("✓ No duplicate records found")
+            
+        return removed_count
     
     def get_player_data(self, player_name, start_date=None, end_date=None):
         """Get all data for a specific player"""
@@ -246,6 +374,9 @@ class MLBDatabaseManager:
             start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
         if not end_date:
             end_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # Get player ID for lookups
+        player_id = self.get_player_id_from_name(player_name)
         
         query_hitting = '''
             SELECT * FROM daily_hitting 
@@ -259,20 +390,32 @@ class MLBDatabaseManager:
             ORDER BY date DESC
         '''
         
-        query_statcast = '''
-            SELECT * FROM statcast_data 
-            WHERE (player_name = ? OR batter = ? OR pitcher = ?) 
-            AND date BETWEEN ? AND ?
-            ORDER BY date DESC
-        '''
+        # Enhanced statcast query to include both ID and name matching
+        if player_id:
+            query_statcast = '''
+                SELECT * FROM statcast_data 
+                WHERE (player_name = ? OR batter = ? OR pitcher = ?) 
+                AND date BETWEEN ? AND ?
+                ORDER BY date DESC
+            '''
+            statcast_df = pd.read_sql_query(query_statcast, self.conn,
+                                           params=(player_name, str(player_id), str(player_id), 
+                                                 start_date, end_date))
+        else:
+            # Fallback to name-only matching
+            query_statcast = '''
+                SELECT * FROM statcast_data 
+                WHERE player_name = ?
+                AND date BETWEEN ? AND ?
+                ORDER BY date DESC
+            '''
+            statcast_df = pd.read_sql_query(query_statcast, self.conn,
+                                           params=(player_name, start_date, end_date))
         
         hitting_df = pd.read_sql_query(query_hitting, self.conn, 
                                       params=(player_name, start_date, end_date))
         pitching_df = pd.read_sql_query(query_pitching, self.conn,
                                        params=(player_name, start_date, end_date))
-        statcast_df = pd.read_sql_query(query_statcast, self.conn,
-                                       params=(player_name, player_name, player_name, 
-                                             start_date, end_date))
         
         return {
             'hitting': hitting_df,

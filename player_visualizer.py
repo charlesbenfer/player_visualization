@@ -4,10 +4,155 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from database_manager import MLBDatabaseManager
+import requests
+from io import BytesIO
+from PIL import Image
+import base64
 
 class PlayerVisualizer:
     def __init__(self, db_manager):
         self.db = db_manager
+        
+    def get_player_info(self, player_name, data):
+        """Extract player basic information"""
+        statcast = data['statcast']
+        
+        if statcast.empty:
+            return {}
+            
+        # Get most recent game info
+        recent = statcast.iloc[0] if not statcast.empty else None
+        
+        # Determine if primarily hitter or pitcher
+        is_pitcher = not data['pitching'].empty
+        is_hitter = not data['hitting'].empty
+        
+        if is_pitcher and is_hitter:
+            position = "Two-Way Player"
+        elif is_pitcher:
+            position = "Pitcher" 
+        else:
+            # Try to get position from statcast data or default to hitter
+            position = "Hitter"
+            
+        team = recent['home_team'] if recent is not None else "Unknown"
+        
+        # Get batting/throwing info from statcast
+        bats = recent['stand'] if recent is not None else "Unknown"
+        throws = recent['p_throws'] if recent is not None else "Unknown"
+        
+        return {
+            'name': player_name,
+            'position': position,
+            'team': team,
+            'bats': bats,
+            'throws': throws
+        }
+    
+    def get_recent_games_stats(self, player_name, data):
+        """Get stats for 3 most recent games plus 45-day totals"""
+        statcast = data['statcast']
+        
+        if statcast.empty:
+            return pd.DataFrame()
+            
+        # Get unique game dates
+        game_dates = sorted(statcast['game_date'].dropna().unique(), reverse=True)[:3]
+        
+        stats_list = []
+        
+        # Determine if this is primarily a pitcher (player_name matches) or we need to look for them as a batter
+        is_pitcher_data = (statcast['player_name'] == player_name).any()
+        
+        # Calculate stats for each recent game
+        for game_date in game_dates:
+            game_data = statcast[statcast['game_date'] == game_date]
+            
+            if is_pitcher_data:
+                # Player is the pitcher in this data
+                pitcher_data = game_data[game_data['player_name'] == player_name]
+                if not pitcher_data.empty:
+                    stats = self._calculate_pitcher_game_stats(pitcher_data, game_date)
+                    stats_list.append(stats)
+            else:
+                # Player should be found as a batter (need to match by ID or different logic)
+                # For now, skip hitter logic since our data seems to be pitcher-centric
+                pass
+        
+        # Add 45-day totals
+        total_stats = self._calculate_45_day_totals(player_name, data)
+        if total_stats:
+            stats_list.append(total_stats)
+            
+        return pd.DataFrame(stats_list)
+    
+    def _calculate_hitter_game_stats(self, game_data, game_date):
+        """Calculate hitting stats for a single game"""
+        total_abs = len(game_data[game_data['type'].isin(['X', 'S'])])  # At-bats (excluding walks, HBP)
+        hits = len(game_data[game_data['events'].isin(['single', 'double', 'triple', 'home_run'])])
+        home_runs = len(game_data[game_data['events'] == 'home_run'])
+        doubles = len(game_data[game_data['events'] == 'double'])
+        triples = len(game_data[game_data['events'] == 'triple'])
+        
+        # Calculate slugging
+        total_bases = hits + doubles + (2 * triples) + (3 * home_runs)
+        slg = total_bases / total_abs if total_abs > 0 else 0
+        avg = hits / total_abs if total_abs > 0 else 0
+        
+        return {
+            'Date': game_date,
+            'AB': total_abs,
+            'H': hits,
+            'HR': home_runs,
+            'AVG': f"{avg:.3f}",
+            'SLG': f"{slg:.3f}"
+        }
+    
+    def _calculate_pitcher_game_stats(self, game_data, game_date):
+        """Calculate pitching stats for a single game"""
+        total_pitches = len(game_data)
+        strikeouts = len(game_data[game_data['events'] == 'strikeout'])
+        
+        # Estimate innings (rough approximation)
+        outs = len(game_data[game_data['events'].isin(['strikeout', 'field_out', 'force_out', 'grounded_into_double_play'])])
+        innings = outs / 3.0
+        
+        return {
+            'Date': game_date,
+            'IP': f"{innings:.1f}",
+            'K': strikeouts,
+            'Pitches': total_pitches
+        }
+    
+    def _calculate_45_day_totals(self, player_name, data):
+        """Calculate 45-day totals"""
+        statcast = data['statcast']
+        
+        # Check if this player appears as pitcher (in player_name column)
+        is_pitcher_data = (statcast['player_name'] == player_name).any()
+        
+        if is_pitcher_data:
+            # Calculate pitching totals
+            pitcher_data = statcast[statcast['player_name'] == player_name]
+            total_pitches = len(pitcher_data)
+            strikeouts = len(pitcher_data[pitcher_data['events'] == 'strikeout'])
+            
+            # Calculate innings more accurately
+            outs = len(pitcher_data[pitcher_data['events'].isin(['strikeout', 'field_out', 'force_out', 'grounded_into_double_play', 'pop_out', 'flyout'])])
+            innings = outs / 3.0
+            
+            return {
+                'Date': '45-Day Total',
+                'IP': f"{innings:.1f}",
+                'K': strikeouts,
+                'Pitches': total_pitches
+            }
+        else:
+            # For now, return empty for hitters since we need better logic to match batter IDs to names
+            return {
+                'Date': '45-Day Total',
+                'Note': 'Hitter data needs ID mapping'
+            }
         
     def create_player_dashboard(self, player_name, save_html=True):
         """Create comprehensive dashboard for a specific player"""
@@ -19,16 +164,12 @@ class PlayerVisualizer:
             print(f"No data found for {player_name}")
             return None
         
-        is_pitcher = not player_data['pitching'].empty
-        is_hitter = not player_data['hitting'].empty
+        # Get player info and recent games stats
+        player_info = self.get_player_info(player_name, player_data)
+        recent_stats = self.get_recent_games_stats(player_name, player_data)
         
-        if is_pitcher and is_hitter:
-            print(f"{player_name} is a two-way player!")
-            fig = self._create_two_way_player_dashboard(player_name, player_data)
-        elif is_pitcher:
-            fig = self._create_pitcher_dashboard(player_name, player_data)
-        else:
-            fig = self._create_hitter_dashboard(player_name, player_data)
+        # Create the new layout dashboard
+        fig = self._create_modern_dashboard(player_name, player_data, player_info, recent_stats)
         
         if save_html:
             filename = f"{player_name.replace(' ', '_')}_dashboard.html"
@@ -36,6 +177,172 @@ class PlayerVisualizer:
             print(f"✓ Dashboard saved as {filename}")
         
         return fig
+    
+    def _create_modern_dashboard(self, player_name, data, player_info, recent_stats):
+        """Create modern dashboard with header and stats table"""
+        
+        # Create subplot structure: header area + stats table + visualizations
+        fig = make_subplots(
+            rows=4, cols=4,
+            row_heights=[0.2, 0.3, 0.25, 0.25],  # Header, stats table, charts row 1, charts row 2
+            subplot_titles=['', '', '', '',  # Header row - no titles
+                           '', '', '', '',  # Stats table row - no titles
+                           'Exit Velocity vs Launch Angle', 'Spray Chart', 'Pitch Velocity', 'Performance Trends',
+                           'Hot Zones', 'Count Performance', 'Key Metrics', 'Recent Form'],
+            specs=[
+                [{'colspan': 4}, None, None, None],  # Header spans all columns
+                [{'type': 'table', 'colspan': 4}, None, None, None],  # Stats table spans all columns
+                [{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'histogram'}, {'type': 'scatter'}],
+                [{'type': 'heatmap'}, {'type': 'bar'}, {'type': 'indicator'}, {'type': 'scatter'}]
+            ],
+            vertical_spacing=0.08
+        )
+        
+        # Add header with player info
+        self._add_player_header(fig, player_info, row=1, col=1)
+        
+        # Add recent games stats table
+        self._add_stats_table(fig, recent_stats, row=2, col=1)
+        
+        # Add visualization charts (simplified for now)
+        self._add_basic_charts(fig, player_name, data)
+        
+        # Update layout
+        fig.update_layout(
+            height=1200,
+            title=f"{player_name} - Performance Dashboard",
+            showlegend=False,
+            font=dict(size=12),
+            plot_bgcolor='white',
+            paper_bgcolor='white'
+        )
+        
+        return fig
+    
+    def _add_player_header(self, fig, player_info, row, col):
+        """Add player information header"""
+        
+        # Create header text
+        header_text = f"""
+        <b>{player_info.get('name', 'Unknown Player')}</b><br>
+        Position: {player_info.get('position', 'N/A')}<br>
+        Team: {player_info.get('team', 'N/A')}<br>
+        Bats/Throws: {player_info.get('bats', 'N/A')}/{player_info.get('throws', 'N/A')}
+        """
+        
+        # Add as annotation since we can't put text in subplot directly
+        fig.add_annotation(
+            text=header_text,
+            xref="paper", yref="paper",
+            x=0.5, y=0.92,
+            showarrow=False,
+            font=dict(size=16),
+            align="center"
+        )
+    
+    def _add_stats_table(self, fig, stats_df, row, col):
+        """Add recent games statistics table"""
+        
+        if stats_df.empty:
+            # Add empty table message
+            fig.add_annotation(
+                text="No recent game data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.6,
+                showarrow=False,
+                font=dict(size=14)
+            )
+            return
+        
+        # Create table
+        table_data = []
+        headers = list(stats_df.columns)
+        
+        # Add each row
+        for _, row_data in stats_df.iterrows():
+            table_data.append(list(row_data.values))
+        
+        fig.add_trace(
+            go.Table(
+                header=dict(
+                    values=headers,
+                    fill_color='white',
+                    align='center',
+                    font=dict(size=14, color='black', family='Arial Black'),
+                    line=dict(color='black', width=3)
+                ),
+                cells=dict(
+                    values=list(zip(*table_data)) if table_data else [[]],
+                    fill_color='white',
+                    align='center',
+                    font=dict(size=12, color='black', family='Arial Black'),
+                    line=dict(color='black', width=3)
+                )
+            ),
+            row=row, col=col
+        )
+    
+    def _add_basic_charts(self, fig, player_name, data):
+        """Add basic visualization charts"""
+        statcast = data['statcast']
+        
+        if statcast.empty:
+            return
+            
+        # Determine if hitter or pitcher
+        as_hitter = statcast[statcast['batter'] == player_name]
+        as_pitcher = statcast[statcast['pitcher'] == player_name]
+        
+        if len(as_hitter) >= len(as_pitcher):
+            self._add_hitter_charts(fig, as_hitter)
+        else:
+            self._add_pitcher_charts(fig, as_pitcher)
+    
+    def _add_hitter_charts(self, fig, hitter_data):
+        """Add charts for hitters"""
+        
+        # Exit velocity vs launch angle (batted balls only)
+        batted_balls = hitter_data[hitter_data['launch_speed'].notna()].copy()
+        if not batted_balls.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=batted_balls['launch_angle'],
+                    y=batted_balls['launch_speed'],
+                    mode='markers',
+                    marker=dict(size=8, opacity=0.6, color='blue'),
+                    name='Batted Balls'
+                ),
+                row=3, col=1
+            )
+        
+        # Spray chart (simplified)
+        if not batted_balls.empty and 'hc_x' in batted_balls.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=batted_balls['hc_x'],
+                    y=batted_balls['hc_y'], 
+                    mode='markers',
+                    marker=dict(size=6, opacity=0.7, color='red'),
+                    name='Hit Location'
+                ),
+                row=3, col=2
+            )
+    
+    def _add_pitcher_charts(self, fig, pitcher_data):
+        """Add charts for pitchers"""
+        
+        # Pitch velocity distribution
+        if not pitcher_data.empty and 'release_speed' in pitcher_data.columns:
+            velocities = pitcher_data['release_speed'].dropna()
+            if not velocities.empty:
+                fig.add_trace(
+                    go.Histogram(
+                        x=velocities,
+                        nbinsx=20,
+                        name='Pitch Velocity'
+                    ),
+                    row=3, col=3
+                )
     
     def _create_hitter_dashboard(self, player_name, data):
         """Create dashboard for a hitter"""
