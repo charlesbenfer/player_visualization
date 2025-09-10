@@ -42,15 +42,17 @@ jobs:
     - name: Generate sample visualizations
       run: |
         # Generate dashboards for a few star players
-        python player_visualizer.py "Shohei Ohtani" || true
-        python player_visualizer.py "Aaron Judge" || true
-        python player_visualizer.py "Mookie Betts" || true
+        python generate_player_viz.py "Shohei Ohtani" || true
+        python generate_player_viz.py "Aaron Judge" || true
+        python generate_player_viz.py "Mookie Betts" || true
     
     - name: Commit and push changes
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git add mlb_data.db *.html *.txt || true
+        git add mlb_data.db || true
+        git add *.html || true
+        git add *.txt || true
         git diff --quiet && git diff --staged --quiet || git commit -m "Daily data update - $(date +'%Y-%m-%d')"
         git push origin main
       env:
